@@ -25,9 +25,17 @@
 
 from binascii import a2b_hex, b2a_hex
 from datetime import datetime
-from socket import socket, timeout, AF_INET, SOCK_STREAM
+from socket import socket, timeout
 from socket import error as socket_error
+from socket import AF_INET, SOCK_STREAM, SOL_SOCKET, IPPROTO_TCP, SO_KEEPALIVE
+
+import os
+
+if os.uname()[0] != u'Darwin':
+    from socket import TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
+
 from struct import pack, unpack
+import random
 import sys
 import ssl
 import select
@@ -52,31 +60,31 @@ NOTIFICATION_COMMAND = 0
 ENHANCED_NOTIFICATION_COMMAND = 1
 
 NOTIFICATION_FORMAT = (
-    '!'   # network big-endian
-    'B'   # command
-    'H'   # token length
-    '32s' # token
-    'H'   # payload length
-    '%ds' # payload
-)
+     '!'   # network big-endian
+     'B'   # command
+     'H'   # token length
+     '32s' # token
+     'H'   # payload length
+     '%ds' # payload
+    )
 
 ENHANCED_NOTIFICATION_FORMAT = (
-    '!'   # network big-endian
-    'B'   # command
-    'I'   # identifier
-    'I'   # expiry
-    'H'   # token length
-    '32s' # token
-    'H'   # payload length
-    '%ds' # payload
-)
+     '!'   # network big-endian
+     'B'   # command
+     'I'   # identifier
+     'I'   # expiry
+     'H'   # token length
+     '32s' # token
+     'H'   # payload length
+     '%ds' # payload
+    )
 
 ERROR_RESPONSE_FORMAT = (
-    '!'   # network big-endian
-    'B'   # command
-    'B'   # status
-    'I'   # identifier
-)
+     '!'   # network big-endian
+     'B'   # command
+     'B'   # status
+     'I'   # identifier
+    )
 
 TOKEN_LENGTH = 32
 ERROR_RESPONSE_LENGTH = 6
@@ -85,6 +93,8 @@ SENT_BUFFER_QTY = 100000
 WAIT_WRITE_TIMEOUT_SEC = 10
 WAIT_READ_TIMEOUT_SEC = 10
 WRITE_RETRY = 3
+SOCKET_ERR_RETRY_WAIT_DEFAULT = 10
+
 
 ER_STATUS = 'status'
 ER_IDENTIFER = 'identifier'
@@ -92,7 +102,7 @@ ER_IDENTIFER = 'identifier'
 class APNs(object):
     """A class representing an Apple Push Notification service connection"""
 
-    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False):
+    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False, ca_certs=None):
         """
         Set use_sandbox to True to use the sandbox (test) APNs servers.
         Default is False.
@@ -101,6 +111,7 @@ class APNs(object):
         self.use_sandbox = use_sandbox
         self.cert_file = cert_file
         self.key_file = key_file
+        self.ca_certs = ca_certs
         self._feedback_connection = None
         self._gateway_connection = None
         self.enhanced = enhanced
@@ -154,7 +165,8 @@ class APNs(object):
             self._feedback_connection = FeedbackConnection(
                 use_sandbox = self.use_sandbox,
                 cert_file = self.cert_file,
-                key_file = self.key_file
+                key_file = self.key_file,
+                ca_certs = self.ca_certs
             )
         return self._feedback_connection
 
@@ -165,6 +177,7 @@ class APNs(object):
                 use_sandbox = self.use_sandbox,
                 cert_file = self.cert_file,
                 key_file = self.key_file,
+                ca_certs = self.ca_certs,
                 enhanced = self.enhanced
             )
         return self._gateway_connection
@@ -174,10 +187,11 @@ class APNsConnection(object):
     """
     A generic connection class for communicating with the APNs
     """
-    def __init__(self, cert_file=None, key_file=None, timeout=None, enhanced=False):
+    def __init__(self, cert_file=None, key_file=None, timeout=None, enhanced=False, ca_certs=None):
         super(APNsConnection, self).__init__()
         self.cert_file = cert_file
         self.key_file = key_file
+        self.ca_certs = ca_certs
         self.timeout = timeout
         self._socket = None
         self._ssl = None
@@ -193,7 +207,20 @@ class APNsConnection(object):
             try:
                 self._socket = socket(AF_INET, SOCK_STREAM)
                 self._socket.settimeout(self.timeout)
+
+                # 'keep alive' for OS X
+                if os.uname()[0] == u'Darwin':
+                    TCP_KEEPALIVE = 0x10
+                    self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    self._socket.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 3)
+                else: # and others
+                    self._socket.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
+                    self._socket.setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, 1)
+                    self._socket.setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, 3)
+                    self._socket.setsockopt(IPPROTO_TCP, TCP_KEEPCNT, 5)
+
                 self._socket.connect((self.server, self.port))
+
                 break
             except timeout:
                 pass
@@ -204,6 +231,7 @@ class APNsConnection(object):
             self._last_activity_time = time.time()
             self._socket.setblocking(False)
             self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file,
+                                        ca_certs=self.ca_certs,
                                         do_handshake_on_connect=False)
             while True:
                 try:
@@ -221,7 +249,7 @@ class APNsConnection(object):
             # Fallback for 'SSLError: _ssl.c:489: The handshake operation timed out'
             for i in range(3):
                 try:
-                    self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file)
+                    self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file, ca_certs=self.ca_certs)
                     break
                 except SSLError as ex:
                     if ex.args[0] == SSL_ERROR_WANT_READ:
@@ -298,7 +326,7 @@ class PayloadTooLargeError(Exception):
 
 class Payload(object):
     """A class representing an APNs message payload"""
-    def __init__(self, alert=None, badge=None, sound=None, category=None, custom=None, content_available=False,
+    def __init__(self, alert=None, badge=None, sound=None, category=None, custom={}, content_available=False,
                  mutable_content=False):
         super(Payload, self).__init__()
         self.alert = alert
@@ -334,8 +362,7 @@ class Payload(object):
             d.update({'mutable-content': 1})
 
         d = { 'aps': d }
-        if self.custom:
-            d.update(self.custom)
+        d.update(self.custom)
         return d
 
     def json(self):
@@ -466,21 +493,21 @@ class GatewayConnection(APNsConnection):
     """
     A class that represents a connection to the APNs gateway server
     """
-
+    
     def __init__(self, use_sandbox=False, **kwargs):
         super(GatewayConnection, self).__init__(**kwargs)
         self.server = (
             'gateway.push.apple.com',
             'gateway.sandbox.push.apple.com')[use_sandbox]
         self.port = 2195
-        if self.enhanced == True: #start error-response monitoring thread
+        if self.enhanced == True: #start error-response monitoring thread       
             self._last_activity_time = time.time()
 
             self._send_lock = threading.RLock()
             self._error_response_handler_worker = None
             self._response_listener = None
 
-        self._sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
+            self._sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
 
     def _init_error_response_handler_worker(self):
         self._send_lock = threading.RLock()
@@ -517,14 +544,17 @@ class GatewayConnection(APNsConnection):
                             TOKEN_LENGTH, token, len(payload), payload)
         return notification
 
-    def send_notification(self, token_hex, payload, identifier=0, expiry=0):
+    def send_notification(self, token_hex, payload, identifier=None, expiry=0):
         """
         in enhanced mode, send_notification may return error response from APNs if any
         """
         if self.enhanced:
             self._last_activity_time = time.time()
-            message = self._get_enhanced_notification(token_hex, payload,
-                                                           identifier, expiry)
+            if identifier is None:
+                identifier = random.getrandbits(32)
+                _logger.warning("identifier should be specified under enchance mode"
+                                ", automatically set to {}".format(identifier))
+            message = self._get_enhanced_notification(token_hex, payload, identifier, expiry)
 
             for i in range(WRITE_RETRY):
                 try:
@@ -534,9 +564,9 @@ class GatewayConnection(APNsConnection):
                         self._sent_notifications.append(dict({'id': identifier, 'message': message}))
                     break
                 except socket_error as e:
-                    delay = 10 + (i * 2)
-                    _logger.exception("sending notification with id:" + str(identifier) +
-                                 " to APNS failed: " + str(type(e)) + ": " + str(e) +
+                    delay = SOCKET_ERR_RETRY_WAIT_DEFAULT + (i * 2)
+                    _logger.exception("sending notification with id:" + str(identifier) + 
+                                 " to APNS failed: " + str(type(e)) + ": " + str(e) + 
                                  " in " + str(i+1) + "th attempt, will wait " + str(delay) + " secs for next action")
                     time.sleep(delay) # wait potential error-response to be read
 
@@ -544,7 +574,7 @@ class GatewayConnection(APNsConnection):
             self.write(self._get_notification(token_hex, payload))
 
     def _make_sure_error_response_handler_worker_alive(self):
-        if (not self._error_response_handler_worker
+        if (not self._error_response_handler_worker 
             or not self._error_response_handler_worker.is_alive()):
             self._init_error_response_handler_worker()
             TIMEOUT_SEC = 10
@@ -556,8 +586,9 @@ class GatewayConnection(APNsConnection):
             _logger.warning("error response handler worker is not started after %s secs" % TIMEOUT_SEC)
 
     def send_notification_multiple(self, frame):
-        self._sent_notifications += frame.get_notifications(self)
-        return self.write(frame.get_frame())
+        if self.enhanced:
+            self._sent_notifications += frame.get_notifications(self)
+        return self.write(bytes(frame.get_frame()))
 
     def register_response_listener(self, response_listener):
         self._response_listener = response_listener
